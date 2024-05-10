@@ -1,0 +1,178 @@
+# action.yml
+name: JENKINS CALLER WORKFLOW
+description: "Trigger Jenkins job from the workflow"
+
+on:
+  workflow_dispatch:
+    inputs:
+      JENKINS_URL:
+        description: 'JENKINS URL'
+        default: 'http://localhost:8080'
+        required: true
+        type: string
+      JENKINS_JOB_NAME:
+        description: 'JENKINS JOB NAME'
+        default: 'JOB_NAME'
+        required: true
+        type: string
+      JENKINS_USER:
+        description: 'JENKINS USER'
+        default: ''
+        required: true
+        type: string
+      JENKINS_API_TOKEN:
+        description: 'JENKINS API TOKEN'
+        default: ''
+        required: true
+        type: string
+      STRING_PARAMETERS:
+        description: 'JENKINS STRING PARAMETERS'
+        default: ''
+        required: false
+        type: string
+           
+runs:
+  using: "composite"
+  steps:
+    - name: Trigger Jenkins Job
+      env:
+        JENKINS_URL: ${{ inputs.JENKINS_URL }}
+        JENKINS_JOB_NAME: ${{ inputs.JENKINS_JOB_NAME }}
+        JENKINS_USER: ${{ inputs.JENKINS_USER }}
+        JENKINS_API_TOKEN: ${{ inputs.JENKINS_API_TOKEN }}
+        STRING_PARAMETERS: ${{ inputs.STRING_PARAMETERS }}
+      id: trigger-job
+      run: |
+        if [ -n "$STRING_PARAMETERS" ]; then
+            echo "Parameters provided."
+            PARAM_STRING="$STRING_PARAMETERS"
+            REQUEST_URL="$JENKINS_URL/job/$JENKINS_JOB_NAME/buildWithParameters?$PARAM_STRING"
+            echo "JENKINS REQUEST URL : $REQUEST_URL"
+        else
+            echo "No parameters provided."
+            PARAM_STRING=""
+            REQUEST_URL="$JENKINS_URL/job/$JENKINS_JOB_NAME/build"
+            echo "JENKINS REQUEST URL : $REQUEST_URL"
+        fi
+        echo "REQUEST_URL=$REQUEST_URL" >> $GITHUB_ENV
+        
+        # Function to get Jenkins Crumb
+        get_jenkins_crumb() {
+            crumb=$(curl -s -X GET "$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,\":\",//crumb)")
+            echo "$crumb"
+        }
+        
+        trigger_jenkins_job_with_apitoken() {
+            local REQUEST_URL="$1"
+            local JENKINS_USER="$2"
+            local JENKINS_API_TOKEN="$3"
+
+            local response=$(curl -s -X POST -D - "$REQUEST_URL" \
+                                --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+                                --data-urlencode delay=0sec \
+                                -o /dev/null \
+                                -D - \
+                                -i)
+            echo "The curl response : $response"
+            queue_id=$(echo "$response" | grep -i "Location" | awk -F '/' '{print $(NF-1)}')
+
+            if [ -z "$queue_id" ]; then
+                echo "Failed to get Queue ID. Jenkins might have encountered an issue."
+                exit 1
+            else
+                echo "Queue ID: $queue_id"
+            fi
+        }
+        
+        trigger_jenkins_job_with_jenkinsCrumb() {
+            local REQUEST_URL="$1"
+            
+            local CRUMB=$(get_jenkins_crumb)
+            local AUTH_HEADER="-H \"Jenkins-Crumb:$CRUMB\""
+
+            local response=$(curl -s -X $AUTH_HEADER POST -D - "$REQUEST_URL" \
+                                -o /dev/null \
+                                -D - \
+                                -i)
+            echo "The curl response : $response"
+            queue_id=$(echo "$response" | grep -i "Location" | awk -F '/' '{print $(NF-1)}')
+
+            if [ -z "$queue_id" ]; then
+                echo "Failed to get Queue ID. Jenkins might have encountered an issue."
+                exit 1
+            else
+                echo "Queue ID: $queue_id"
+            fi
+        }
+
+        # Check if JENKINS_API_TOKEN is provided
+        if [ -n "$JENKINS_API_TOKEN" ]; then
+            echo "JENKINS JOB CALLED USING API TOKEN"
+            trigger_jenkins_job_with_apitoken "$REQUEST_URL" "$JENKINS_USER" "$JENKINS_API_TOKEN"
+        else
+            # If JENKINS_API_TOKEN is not provided, get Jenkins Crumb
+            echo "JENKINS JOB CALLED USING JENKINS CRUMB"
+            trigger_jenkins_job_with_jenkinsCrumb "$REQUEST_URL"
+        fi
+        
+        # Fetching JSON response from Jenkins API to fetch the BUILD NUMBER
+        response=$(curl -s $JENKINS_URL/queue/item/$queue_id/api/json?pretty=true --user "$JENKINS_USER:$JENKINS_API_TOKEN")
+
+        # Extracting the value of "number" field from JSON response
+        BUILD_NUMBER=$(echo "$response" | grep -o '"number" : [0-9]*' | awk '{print $3}')
+
+        # Checking if build number is empty If empty exit the action
+        if [ -z "$BUILD_NUMBER" ]; then
+            echo "Failed to get Build Number. Jenkins might have encountered an issue."
+            exit 1
+        fi
+
+        echo "Jenkins Job's Build Number: $BUILD_NUMBER"
+
+        # Function to fetch Jenkin's execution console.
+        fetch_console_output() {
+            curl -s "$JENKINS_URL/job/$JENKINS_JOB_NAME/$BUILD_NUMBER/consoleText"
+        }
+
+        # Function to check if job is completed
+        is_job_completed() {
+            job_status=$(curl -s "$JENKINS_URL/job/$JENKINS_JOB_NAME/$BUILD_NUMBER/api/json" | grep -o '"result" *: *"[^"]*"' | awk -F'"' '{print $4}')
+            if [ "$job_status" == "SUCCESS" ] || [ "$job_status" == "FAILURE" ] || [ "$job_status" == "ABORTED" ]; then
+                return 0  # Job completed
+            else
+                return 1  # Job still in progress
+            fi
+        }
+
+        # Continuously check job status until job completes
+        echo "Checking job status continuously..."
+        while ! is_job_completed; do
+            # Wait for a while before checking again
+            sleep 5
+        done
+        
+        echo "Job is completed with status: $job_status"
+        
+        # If job status is SUCCESS, fetch console output and exit with status 0
+        if [ "$job_status" == "SUCCESS" ]; then
+            echo "-----------------------------SUCCESS----------------------------------------"
+            echo "Fetching console output for success..."
+            sleep 5
+            success_console_output=$(fetch_console_output)
+            echo "$success_console_output"
+            echo "-----------------------------DONE-------------------------------------------"
+            exit 0
+        fi
+       
+        # If job status is FAILURE or ABORTED, fetch console output and exit with status 1
+        if [ "$job_status" == "FAILURE" ] || [ "$job_status" == "ABORTED" ]; then
+            echo "-----------------------------FAILURE/ABORTED----------------------------------------"
+            echo "Fetching console output for the reason of failure..."
+            sleep 5
+            failure_console_output=$(fetch_console_output)
+            echo "$failure_console_output"
+            echo "Job failed or was aborted! Exiting with status 1."
+            echo "-----------------------------DONE---------------------------------------------------"
+            exit 1
+        fi
+      shell: bash
